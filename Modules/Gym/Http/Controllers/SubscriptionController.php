@@ -1,0 +1,804 @@
+<?php
+
+namespace Modules\Gym\Http\Controllers;
+
+use Illuminate\Contracts\Support\Renderable;
+use Illuminate\Http\Request;
+use Illuminate\Routing\Controller;
+use App\Contact;
+use App\Utils\Util;
+use Carbon\Carbon;
+use App\Transaction;
+use App\Business;
+use Illuminate\Support\Facades\DB;
+use Yajra\DataTables\Facades\DataTables;
+use App\Utils\NotificationUtil;
+use App\Utils\ContactUtil;
+use App\Utils\TransactionUtil;
+use Modules\Hms\Notifications\CustomerNotification;
+use App\Utils\ModuleUtil;
+use App\Utils\ProductUtil;
+use App\Utils\BusinessUtil;
+use Modules\Gym\Entities\GymPackage;
+use Modules\Gym\Services\SessionTrackingService;
+use Modules\Accounting\Utils\AccountingUtil;
+use App\Account;
+
+
+class SubscriptionController extends Controller
+{
+    protected $commonUtil;
+    protected $notificationUtil;
+    protected $contactUtil;
+    protected $transactionUtil;
+    protected $dummyPaymentLine;
+    protected $productUtil;
+    protected $businessUtil;
+    protected $moduleUtil;
+    protected $sessionTrackingService;
+    protected $accountingUtil;
+
+    public function __construct(
+        Util $commonUtil,
+        NotificationUtil $notificationUtil,
+        ContactUtil $contactUtil,
+        TransactionUtil $transactionUtil,
+        ModuleUtil $moduleUtil,
+        ProductUtil $productUtil,
+        BusinessUtil $businessUtil,
+        SessionTrackingService $sessionTrackingService,
+        AccountingUtil $accountingUtil,
+
+    ) {
+        $this->commonUtil = $commonUtil;
+        $this->notificationUtil = $notificationUtil;
+        $this->contactUtil = $contactUtil;
+        $this->transactionUtil = $transactionUtil;
+        $this->moduleUtil = $moduleUtil;
+        $this->productUtil = $productUtil;
+        $this->businessUtil = $businessUtil;
+        $this->sessionTrackingService = $sessionTrackingService;
+        $this->accountingUtil = $accountingUtil;
+
+        $this->dummyPaymentLine = [
+            'method' => 'cash',
+            'amount' => 0,
+            'note' => '',
+            'card_transaction_number' => '',
+            'card_number' => '',
+            'card_type' => '',
+            'card_holder_name' => '',
+            'card_month' => '',
+            'card_year' => '',
+            'card_security' => '',
+            'cheque_number' => '',
+            'bank_account_number' => '',
+            'is_return' => 0,
+            'transaction_no' => '',
+        ];
+    }
+    /**
+     * Display a listing of the resource.
+     * @return Renderable
+     */
+
+    public function index(Request $request)
+    {
+        $business_id = request()->session()->get('user.business_id');
+
+        if (request()->ajax()) {
+            $payment_types = $this->transactionUtil->payment_types(null, true, $business_id);
+
+            $subscriptions = Transaction::where('transactions.business_id', $business_id)
+                ->with(['payment_lines'])
+                ->leftjoin('contacts as c', 'transactions.contact_id', '=', 'c.id')
+                ->leftJoin('gym_packages AS gp', 'transactions.gym_package_id', '=', 'gp.id')
+                ->where('transactions.type', 'gym_subscription')
+                ->select('gp.name as p_name', 'transactions.*', 'c.name as c_name', DB::raw('(SELECT SUM(IF(TP.is_return = 1,-1*TP.amount,TP.amount)) FROM transaction_payments AS TP WHERE
+                        TP.transaction_id=transactions.id) as total_paid'));
+
+                if($request->customer_id){
+                    $subscriptions = $subscriptions->where('c.id',$request->customer_id);
+                }
+
+                if($request->package_id){
+                    $subscriptions = $subscriptions->where('transactions.gym_package_id',$request->package_id);
+                }
+
+                if($request->payment_status){
+                    $subscriptions = $subscriptions->where('transactions.payment_status',$request->payment_status);
+                }         
+
+            return Datatables::of($subscriptions)
+
+                ->editColumn('created_at', '{{@format_datetime($created_at)}}')
+
+                ->editColumn(
+                    'payment_status',
+                    function ($row) {
+                        $payment_status = Transaction::getPaymentStatus($row);
+
+                        return (string) view('sell.partials.payment_status', ['payment_status' => $payment_status, 'id' => $row->id]);
+                    }
+                )
+                ->addColumn('payment_methods', function ($row) use ($payment_types) {
+                    $methods = array_unique($row->payment_lines->pluck('method')->toArray());
+                    $count = count($methods);
+                    $payment_method = '';
+                    if ($count == 1) {
+                        $payment_method = $payment_types[$methods[0]] ?? '';
+                    } elseif ($count > 1) {
+                        $payment_method = __('lang_v1.checkout_multi_pay');
+                    }
+
+                    $html = ! empty($payment_method) ? '<span class="payment-method" data-orig-value="' . $payment_method . '" data-status-name="' . $payment_method . '">' . $payment_method . '</span>' : '';
+
+                    return $html;
+                })
+                ->addColumn('package', function ($row) {
+                    if (!$row->gym_package_start_date) {
+                        return '';
+                    }
+                    $startDate = $this->commonUtil->format_date($row->gym_package_start_date);
+                    $endDateText = '';
+                    $daysLeftText = '';
+                    $daysLeftClass = 'bg-info'; // Default class
+                
+                    if ($row->gym_package_end_date) {
+                        $gymEndDate = Carbon::parse($row->gym_package_end_date);
+                
+                        // Calculate days left
+                        $daysLeft = $gymEndDate->isPast() ? 0 : $gymEndDate->diffInDays(Carbon::now());
+                        $endDateText = $this->commonUtil->format_date($gymEndDate);
+                
+                        // Determine days left or expiration status
+                        if ($gymEndDate->isPast()) {
+                            $daysLeftText = __('gym::lang.expired');
+                            $daysLeftClass = 'tw-bg-red-400';
+                        } else {
+                            $daysLeftText = "$daysLeft " . __('gym::lang.days_remaining');
+                        }
+                    } else {
+                        // If gym_package_end_date is null, show "Lifetime"
+                        $endDateText = __('gym::lang.lifetime');
+                        $daysLeftText = __('gym::lang.lifetime');
+                    }
+
+                      // Check if the package has not started yet
+                      if (Carbon::parse($row->gym_package_start_date)->isAfter(Carbon::now())) {
+                        $daysLeft = Carbon::parse($row->gym_package_start_date)->diffInDays(Carbon::now());
+                        $daysLeftText = __('gym::lang.start_in') . ' ' . $daysLeft . ' ' . __('gym::lang.days');
+                        $daysLeftClass = 'bg-info';
+                    }
+
+                    // Session limit info
+                    $sessionHtml = '';
+                    $package = GymPackage::find($row->gym_package_id);
+                    
+                    // Session time limit (hours/minutes)
+                    if ($package && $package->session_limit_enabled && $package->session_limit_minutes) {
+                        $usedMinutes = $row->gym_used_minutes ?? 0;
+                        $remainingMinutes = $row->gym_remaining_minutes ?? $package->session_limit_minutes;
+                        
+                        $usedHours = floor($usedMinutes / 60);
+                        $usedMins = $usedMinutes % 60;
+                        $remainingHours = floor($remainingMinutes / 60);
+                        $remainingMins = $remainingMinutes % 60;
+                        
+                        $sessionHtml .= '
+                            <div class="mt-1" style="margin-top: 5px; padding-top: 5px; border-top: 1px dashed #ddd;">
+                                <small class="text-muted"><i class="fa fa-clock"></i> ' . __('gym::lang.session_time_limit') . '</small><br>
+                                <small>' . __('gym::lang.remaining_time') . ': <strong>' . $remainingHours . 'h ' . $remainingMins . 'm</strong></small><br>
+                                <small>' . __('gym::lang.used_time') . ': ' . $usedHours . 'h ' . $usedMins . 'm</small>
+                            </div>
+                        ';
+                    }
+                    
+                    // Session count limit (per visit)
+                    if ($package && $package->session_count_enabled && $package->session_count_limit) {
+                        $usedSessions = $row->gym_used_sessions ?? 0;
+                        $remainingSessions = $row->gym_remaining_sessions ?? $package->session_count_limit;
+                        
+                        $sessionHtml .= '
+                            <div class="mt-1" style="margin-top: 5px; padding-top: 5px; border-top: 1px dashed #ddd;">
+                                <small class="text-muted"><i class="fa fa-ticket"></i> ' . __('gym::lang.session_count_limit') . '</small><br>
+                                <small>' . __('gym::lang.remaining_sessions') . ': <strong>' . $remainingSessions . '</strong></small><br>
+                                <small>' . __('gym::lang.used_sessions') . ': ' . $usedSessions . '</small>
+                            </div>
+                        ';
+                    }
+                    
+                    // Session status badge
+                    if ($package && ($package->session_limit_enabled || $package->session_count_enabled)) {
+                        $sessionStatus = $row->gym_session_status ?? 'active';
+                        $sessionStatusClass = $sessionStatus === 'exhausted' ? 'tw-bg-red-400' : 'bg-success';
+                        $sessionStatusText = $sessionStatus === 'exhausted' ? __('gym::lang.exhausted') : __('gym::lang.active');
+                        
+                        $sessionHtml .= '<div style="margin-top: 5px;"><span class="label ' . $sessionStatusClass . '">' . $sessionStatusText . '</span></div>';
+                    }
+                
+                    // Format the HTML output
+                    return '
+                        <div>
+                            <p class="text-muted">' . e($row->p_name) . '</p>
+                            <p class="text-muted">' . $startDate . ' - ' . $endDateText . '</p>
+                            <span class="label ' . $daysLeftClass . '">' . $daysLeftText . '</span>
+                            ' . $sessionHtml . '
+                        </div>
+                    ';
+                })
+                ->editColumn(
+                    'final_total',
+                    '<span class="final-total" data-orig-value="{{$final_total}}">@format_currency($final_total)</span>'
+                )
+                ->editColumn(
+                    'total_paid',
+                    '<span class="total-paid" data-orig-value="{{$total_paid}}">@format_currency($total_paid)</span>'
+                )
+                ->addColumn('total_remaining', function ($row) {
+                    $total_remaining = $row->final_total - $row->total_paid;
+                    $total_remaining_html = '<span class="payment_due" data-orig-value="' . $total_remaining . '">' . $this->transactionUtil->num_f($total_remaining, true) . '</span>';
+
+                    return $total_remaining_html;
+                })
+                ->addColumn('action', function ($row) {
+                    $html = '<div class="btn-group"><button type="button" class="tw-dw-btn tw-dw-btn-xs tw-dw-btn-outline  tw-dw-btn-info tw-w-max dropdown-toggle" data-toggle="dropdown" aria-expanded="false">'.__('messages.actions').'<span class="caret"></span><span class="sr-only">Toggle Dropdown</span></button><ul class="dropdown-menu dropdown-menu-left" role="menu">';
+                    
+                    $html .= '<li><a href="' . action([\Modules\Gym\Http\Controllers\SubscriptionController::class, 'edit'], ['subscription' => $row->id]) . '">
+                        <i class="fas fa-edit"></i> ' . __('messages.edit') . '</a></li>';
+                    
+                    // Print Invoice
+                    $html .= '<li><a href="' . action([\Modules\Gym\Http\Controllers\SubscriptionController::class, 'printInvoice'], ['id' => $row->id]) . '" target="_blank">
+                        <i class="fas fa-print"></i> ' . __('gym::lang.print_invoice') . '</a></li>';
+                    
+                    // Check if expired - show renewal option
+                    $isExpired = $row->gym_package_end_date && Carbon::parse($row->gym_package_end_date)->isPast();
+                    if ($isExpired) {
+                        $html .= '<li><a href="' . action([\Modules\Gym\Http\Controllers\SubscriptionController::class, 'renewForm'], ['id' => $row->id]) . '" class="text-success">
+                            <i class="fas fa-sync-alt"></i> ' . __('gym::lang.renew_subscription') . '</a></li>';
+                    }
+                    
+                    // Link to view deferred revenue schedule
+                    $html .= '<li><a href="' . route('gym.deferred-revenue.schedule', ['transaction_id' => $row->id]) . '">
+                        <i class="fas fa-calendar-alt"></i> ' . __('gym::lang.deferred_revenue_schedule') . '</a></li>';
+                    
+                    // hanya yang belum paid
+                    if ($row->payment_status != 'paid') {
+                        $html .= '<li><a href="' . action([\Modules\Gym\Http\Controllers\SubscriptionController::class, 'destroy'], ['subscription' => $row->id]) . '" class="delete-subscription" data-href="' . action([\Modules\Gym\Http\Controllers\SubscriptionController::class, 'destroy'], ['subscription' => $row->id]) . '">
+                            <i class="fas fa-trash"></i> ' . __('messages.delete') . '</a></li>';
+                    }
+                    
+                    $html .= '</ul></div>';
+                    
+                    return $html;
+                })
+                ->rawColumns(['created_at', 'payment_status', 'payment_methods', 'final_total', 'total_paid', 'total_remaining', 'package', 'action'])
+                ->make(true);
+        }
+
+        $customers = Contact::customersDropdown($business_id, false);
+
+        $packages = GymPackage::get()->pluck('name', 'id');
+
+        return view('gym::subscription.index', compact('customers', 'packages'));
+    }
+
+    public function add_subscription($id)
+    {
+        $business_id = request()->session()->get('user.business_id');
+
+        if (! (auth()->user()->can('superadmin') || $this->moduleUtil->hasThePermissionInSubscription($business_id, 'gym_module'))) {
+            abort(403, 'Unauthorized action.');
+        }
+
+        $contact = Contact::findOrFail($id);
+
+        $customer_due = $this->transactionUtil->getContactDue($contact->id, $business_id);
+
+
+        $customer_due = $customer_due != 0 ? $this->transactionUtil->num_f($customer_due, true) : '';
+
+
+        $packages = GymPackage::where('business_id', $business_id)->get();
+
+        $payment_line = $this->dummyPaymentLine;
+        $payment_types = $this->productUtil->payment_types(null, true, $business_id);
+        $change_return = $this->dummyPaymentLine;
+        $accounts = [];
+        if ($this->moduleUtil->isModuleEnabled('account')) {
+            $accounts = Account::forDropdown($business_id, true, false, true);
+        }
+
+        return view('gym::subscription.create', compact('contact', 'customer_due', 'packages', 'payment_line', 'payment_types', 'change_return', 'accounts'));
+    }
+
+    /**
+     * Show the form for creating a new resource.
+     * @return Renderable
+     */
+    public function create()
+    {
+        return view('gym::create');
+    }
+
+    /**
+     * Store a newly created resource in storage.
+     * @param Request $request
+     * @return Renderable
+     */
+    public function store(Request $request)
+    {
+
+        // return $request;
+        $business_id = request()->session()->get('user.business_id');
+
+
+        DB::beginTransaction();
+
+        try {
+
+            $business_id = request()->session()->get('user.business_id');
+
+            $busines = Business::findOrFail($business_id);
+
+            $prefix = json_decode($busines->hms_settings)->prefix ?? null;
+
+            $ref_no = null;
+
+            $ref_count = $this->commonUtil->setAndGetReferenceCount("gym", $business_id);
+            //Generate reference number
+            $ref_no = $this->commonUtil->generateReferenceNumber('gym', $ref_count, $business_id, $prefix);
+
+            // store in transsaction discount_amount
+            $location_id = request()->session()->get('user.business_location_id');
+            
+            $transaction = new Transaction();
+            $transaction->business_id = $business_id;
+            $transaction->location_id = $location_id;
+            $transaction->type = 'gym_subscription';
+            $transaction->status = 'final';
+            $transaction->contact_id = $request->contact_id;
+            $transaction->created_by = auth()->user()->id;
+            $transaction->transaction_date = now();
+            $transaction->ref_no = $ref_no;
+            $transaction->total_before_tax = (is_null($request->final_total_input) ? 0 : $request->final_total_input) + (is_null($request->total_discount) ? 0 : $request->total_discount);
+            $transaction->final_total = is_null($request->final_total_input) ? 0 : $request->final_total_input;
+
+            $transaction->tax_amount = is_null($request->total_discount) ? 0 : $request->total_discount;
+
+            $transaction->discount_amount = is_null($request->total_discount) ? 0 : $request->total_discount;
+
+            $transaction->discount_type = is_null($request->total_discount) ? null : $request->discount_type;
+            $transaction->gym_package_start_date = $this->commonUtil->uf_date($request->start_date);
+            $transaction->gym_package_end_date = $request->end_date == 'Lifetime' ? null : $this->commonUtil->uf_date($request->end_date);
+            $transaction->gym_package_id = $request->package_id;
+            $transaction->gym_priority = $request->priority ?? 'normal';
+            $transaction->save();
+
+            // Initialize session tracking for the new subscription
+            $package = GymPackage::find($request->package_id);
+            if ($package) {
+                $this->sessionTrackingService->initializeSessionTracking($transaction, $package);
+            }
+
+
+            //Add change return
+            $input = $request->except('_token');
+            //Add change return
+            $change_return = $this->dummyPaymentLine;
+            if (! empty($input['payment']['change_return'])) {
+                $change_return = $input['payment']['change_return'];
+                unset($input['payment']['change_return']);
+            }
+
+            $change_return['amount'] = $input['change_return'] ?? 0;
+            $change_return['is_return'] = 1;
+
+            $input['payment'][] = $change_return;
+
+
+            if (! empty($input['payment'])) {
+                $this->transactionUtil->createOrUpdatePaymentLines($transaction, $input['payment']);
+            }
+
+            $this->transactionUtil->updatePaymentStatus($transaction->id, $transaction->final_total);
+
+            // Auto-map to accounting if package has accounting mapping configured
+            $this->accountingUtil->autoMapGymSubscription($transaction->id, auth()->user()->id);
+
+            DB::commit();
+
+            $output = [
+                'success' => 1,
+                'msg' => __('lang_v1.success'),
+            ];
+
+            return redirect()->action(
+                [\Modules\Gym\Http\Controllers\MemberController::class, 'index']
+            )
+                ->with('status', $output);
+        } catch (\Exception $e) {
+            DB::rollBack();
+            \Log::emergency('File:' . $e->getFile() . 'Line:' . $e->getLine() . 'Message:' . $e->getMessage());
+
+            $output = [
+                'success' => 0,
+                'msg' => __('messages.something_went_wrong'),
+            ];
+
+            return back()->with('status', $output)->withInput();
+        }
+    }
+
+    /**
+     * Show the specified resource.
+     * @param int $id
+     * @return Renderable
+     */
+    public function show($id)
+    {
+        return view('gym::show');
+    }
+
+    /**
+     * Show the form for editing the specified resource.
+     * @param int $id
+     * @return Renderable
+     */
+    public function edit($id)
+    {
+        $business_id = request()->session()->get('user.business_id');
+
+        if (! (auth()->user()->can('superadmin') || $this->moduleUtil->hasThePermissionInSubscription($business_id, 'gym_module'))) {
+            abort(403, 'Unauthorized action.');
+        }
+
+        $subscription = Transaction::where('business_id', $business_id)
+            ->where('type', 'gym_subscription')
+            ->with(['contact', 'payment_lines'])
+            ->findOrFail($id);
+
+        $contact = $subscription->contact;
+
+        $customer_due = $this->transactionUtil->getContactDue($contact->id, $business_id);
+        $customer_due = $customer_due != 0 ? $this->transactionUtil->num_f($customer_due, true) : '';
+
+        $packages = GymPackage::where('business_id', $business_id)->get();
+
+        $payment_line = $this->dummyPaymentLine;
+        $payment_types = $this->productUtil->payment_types(null, true, $business_id);
+        $change_return = $this->dummyPaymentLine;
+        $accounts = [];
+        if ($this->moduleUtil->isModuleEnabled('account')) {
+            $accounts = Account::forDropdown($business_id, true, false, true);
+        }
+
+        return view('gym::subscription.edit', compact('subscription', 'contact', 'customer_due', 'packages', 'payment_line', 'payment_types', 'change_return', 'accounts'));
+    }
+
+    /**
+     * Update the specified resource in storage.
+     * @param Request $request
+     * @param int $id
+     * @return Renderable
+     */
+    public function update(Request $request, $id)
+    {
+        $business_id = request()->session()->get('user.business_id');
+
+        if (! (auth()->user()->can('superadmin') || $this->moduleUtil->hasThePermissionInSubscription($business_id, 'gym_module'))) {
+            abort(403, 'Unauthorized action.');
+        }
+
+        DB::beginTransaction();
+
+        try {
+            $subscription = Transaction::where('business_id', $business_id)
+                ->where('type', 'gym_subscription')
+                ->findOrFail($id);
+
+            // Update subscription fields
+            $subscription->total_before_tax = (is_null($request->final_total_input) ? 0 : $request->final_total_input) + (is_null($request->total_discount) ? 0 : $request->total_discount);
+            $subscription->final_total = is_null($request->final_total_input) ? 0 : $request->final_total_input;
+            $subscription->tax_amount = is_null($request->total_discount) ? 0 : $request->total_discount;
+            $subscription->discount_amount = is_null($request->total_discount) ? 0 : $request->total_discount;
+            $subscription->discount_type = is_null($request->total_discount) ? null : $request->discount_type;
+            $subscription->gym_package_start_date = $this->commonUtil->uf_date($request->start_date);
+            $subscription->gym_package_end_date = $request->end_date == 'Lifetime' ? null : $this->commonUtil->uf_date($request->end_date);
+            $subscription->gym_package_id = $request->package_id;
+            $subscription->gym_priority = $request->priority ?? 'normal';
+            $subscription->save();
+
+            // Re-initialize session tracking if package changed
+            $package = GymPackage::find($request->package_id);
+            if ($package) {
+                $this->sessionTrackingService->initializeSessionTracking($subscription, $package);
+            }
+
+            // Handle payment updates
+            $input = $request->except('_token');
+            
+            //Add change return
+            $change_return = $this->dummyPaymentLine;
+            if (! empty($input['payment']['change_return'])) {
+                $change_return = $input['payment']['change_return'];
+                unset($input['payment']['change_return']);
+            }
+
+            $change_return['amount'] = $input['change_return'] ?? 0;
+            $change_return['is_return'] = 1;
+
+            $input['payment'][] = $change_return;
+
+            if (! empty($input['payment'])) {
+                $this->transactionUtil->createOrUpdatePaymentLines($subscription, $input['payment']);
+            }
+
+            $this->transactionUtil->updatePaymentStatus($subscription->id, $subscription->final_total);
+
+            DB::commit();
+
+            $output = [
+                'success' => 1,
+                'msg' => __('lang_v1.updated_success'),
+            ];
+
+            return redirect()->action(
+                [\Modules\Gym\Http\Controllers\SubscriptionController::class, 'index']
+            )->with('status', $output);
+
+        } catch (\Exception $e) {
+            DB::rollBack();
+            \Log::emergency('File:' . $e->getFile() . 'Line:' . $e->getLine() . 'Message:' . $e->getMessage());
+
+            $output = [
+                'success' => 0,
+                'msg' => __('messages.something_went_wrong'),
+            ];
+
+            return back()->with('status', $output)->withInput();
+        }
+    }
+
+    /**
+     * Remove the specified resource from storage.
+     * @param int $id
+     * @return Renderable
+     */
+    public function destroy($id)
+    {
+        $business_id = request()->session()->get('user.business_id');
+
+        if (! (auth()->user()->can('superadmin') || $this->moduleUtil->hasThePermissionInSubscription($business_id, 'gym_module'))) {
+            abort(403, 'Unauthorized action.');
+        }
+
+        try {
+            $subscription = Transaction::where('business_id', $business_id)
+                ->where('type', 'gym_subscription')
+                ->findOrFail($id);
+
+            // Delete related payment lines
+            $subscription->payment_lines()->delete();
+
+            // Delete the subscription
+            $subscription->delete();
+
+            $output = [
+                'success' => true,
+                'msg' => __('lang_v1.deleted_success'),
+            ];
+        } catch (\Exception $e) {
+            \Log::emergency('File:' . $e->getFile() . 'Line:' . $e->getLine() . 'Message:' . $e->getMessage());
+            
+            $output = [
+                'success' => false,
+                'msg' => __('messages.something_went_wrong'),
+            ];
+        }
+
+        return $output;
+    }
+
+    public function get_end_date(Request $request)
+    {
+        $business_id = request()->session()->get('user.business_id');
+
+        $start_date = $this->commonUtil->uf_date($request->start_date);
+
+        $package = GymPackage::where('business_id', $business_id)->findOrFail($request->id);
+
+        $end_date = $this->exp_date($package->duration, $start_date);
+
+        return response()->json([
+            'status' => true,
+            'package' => $package,
+            'end_date' => $end_date,
+        ]);
+    }
+
+    public function exp_date($duration, $start_date)
+    {
+        $start_date =  Carbon::parse($start_date);
+        $duration_key = $duration; // The selected duration key (e.g., 'monthly')
+
+        // Calculate the end_date based on the duration
+        switch ($duration_key) {
+            case 'monthly':
+                $end_date = $start_date->addMonth();
+                break;
+            case 'quarterly':
+                $end_date = $start_date->addMonths(3);
+                break;
+            case 'half-yearly':
+                $end_date = $start_date->addMonths(6);
+                break;
+            case 'yearly':
+                $end_date = $start_date->addYear();
+                break;
+            case 'lifetime':
+                $end_date = null; // Lifetime means no expiration
+                break;
+            default:
+                throw new \Exception('Invalid duration key');
+        }
+
+        if ($end_date === null) {
+            return 'Lifetime';
+        }
+
+        // Convert the end_date to a string in the required format (Y-m-d)
+        $end_date_string = $end_date->toDateString();  // Y-m-d format
+
+        return $this->commonUtil->format_date($end_date_string);
+    }
+
+    /**
+     * Show renewal form for expired subscription
+     */
+    public function renewForm($id)
+    {
+        $business_id = request()->session()->get('user.business_id');
+
+        if (! (auth()->user()->can('superadmin') || $this->moduleUtil->hasThePermissionInSubscription($business_id, 'gym_module'))) {
+            abort(403, 'Unauthorized action.');
+        }
+
+        $subscription = Transaction::where('business_id', $business_id)
+            ->where('type', 'gym_subscription')
+            ->with(['contact', 'gym_package'])
+            ->findOrFail($id);
+
+        $contact = $subscription->contact;
+        $package = $subscription->gym_package;
+
+        $customer_due = $this->transactionUtil->getContactDue($contact->id, $business_id);
+        $customer_due = $customer_due != 0 ? $this->transactionUtil->num_f($customer_due, true) : '';
+
+        $packages = GymPackage::where('business_id', $business_id)->get();
+
+        $payment_line = $this->dummyPaymentLine;
+        $payment_types = $this->productUtil->payment_types(null, true, $business_id);
+        $change_return = $this->dummyPaymentLine;
+        $accounts = [];
+        if ($this->moduleUtil->isModuleEnabled('account')) {
+            $accounts = Account::forDropdown($business_id, true, false, true);
+        }
+
+        return view('gym::subscription.renew', compact(
+            'subscription', 
+            'contact', 
+            'package',
+            'customer_due', 
+            'packages', 
+            'payment_line', 
+            'payment_types', 
+            'change_return', 
+            'accounts'
+        ));
+    }
+
+    /**
+     * Process subscription renewal
+     */
+    public function renew(Request $request, $id)
+    {
+        $business_id = request()->session()->get('user.business_id');
+
+        if (! (auth()->user()->can('superadmin') || $this->moduleUtil->hasThePermissionInSubscription($business_id, 'gym_module'))) {
+            abort(403, 'Unauthorized action.');
+        }
+
+        DB::beginTransaction();
+
+        try {
+            $old_subscription = Transaction::where('business_id', $business_id)
+                ->where('type', 'gym_subscription')
+                ->findOrFail($id);
+
+            // Update the existing subscription instead of creating a new one
+            $old_subscription->gym_package_start_date = $this->commonUtil->uf_date($request->start_date);
+            $old_subscription->gym_package_end_date = $request->end_date == 'Lifetime' ? null : $this->commonUtil->uf_date($request->end_date);
+            $old_subscription->gym_package_id = $request->package_id;
+            
+            // Reset session tracking
+            $package = GymPackage::find($request->package_id);
+            if ($package) {
+                $this->sessionTrackingService->initializeSessionTracking($old_subscription, $package);
+            }
+
+            // Update financial info if changed
+            $old_subscription->total_before_tax = (is_null($request->final_total_input) ? 0 : $request->final_total_input) + (is_null($request->total_discount) ? 0 : $request->total_discount);
+            $old_subscription->final_total = is_null($request->final_total_input) ? 0 : $request->final_total_input;
+            $old_subscription->discount_amount = is_null($request->total_discount) ? 0 : $request->total_discount;
+            $old_subscription->discount_type = is_null($request->total_discount) ? null : $request->discount_type;
+            $old_subscription->renewed_from_id = $id;
+            $old_subscription->save();
+
+            // Handle payment
+            $input = $request->except('_token');
+            $change_return = $this->dummyPaymentLine;
+            if (! empty($input['payment']['change_return'])) {
+                $change_return = $input['payment']['change_return'];
+                unset($input['payment']['change_return']);
+            }
+
+            $change_return['amount'] = $input['change_return'] ?? 0;
+            $change_return['is_return'] = 1;
+
+            $input['payment'][] = $change_return;
+
+            if (! empty($input['payment'])) {
+                $this->transactionUtil->createOrUpdatePaymentLines($old_subscription, $input['payment']);
+            }
+
+            $this->transactionUtil->updatePaymentStatus($old_subscription->id, $old_subscription->final_total);
+
+            // Auto-map to accounting if package has accounting mapping configured
+            $this->accountingUtil->autoMapGymSubscription($old_subscription->id, auth()->user()->id);
+
+            DB::commit();
+
+            $output = [
+                'success' => 1,
+                'msg' => __('gym::lang.renewal_success'),
+            ];
+
+            return redirect()->action(
+                [\Modules\Gym\Http\Controllers\SubscriptionController::class, 'index']
+            )->with('status', $output);
+
+        } catch (\Exception $e) {
+            DB::rollBack();
+            \Log::emergency('File:' . $e->getFile() . 'Line:' . $e->getLine() . 'Message:' . $e->getMessage());
+
+            $output = [
+                'success' => 0,
+                'msg' => __('messages.something_went_wrong'),
+            ];
+
+            return back()->with('status', $output)->withInput();
+        }
+    }
+
+    /**
+     * Print subscription invoice
+     */
+    public function printInvoice($id)
+    {
+        $business_id = request()->session()->get('user.business_id');
+
+        if (! (auth()->user()->can('superadmin') || $this->moduleUtil->hasThePermissionInSubscription($business_id, 'gym_module'))) {
+            abort(403, 'Unauthorized action.');
+        }
+
+        $subscription = Transaction::where('business_id', $business_id)
+            ->where('type', 'gym_subscription')
+            ->with(['contact', 'gym_package', 'payment_lines', 'business_location'])
+            ->findOrFail($id);
+
+        $business = Business::findOrFail($business_id);
+
+        return view('gym::subscription.invoice', compact('subscription', 'business'));
+    }
+}

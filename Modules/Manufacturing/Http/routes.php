@@ -1,0 +1,16 @@
+<?php
+
+Route::group(['middleware' => ['web', 'IsInstalled', 'SetSessionData', 'auth', 'language', 'timezone'], 'prefix' => 'manufacturing', 'namespace' => 'Modules\Manufacturing\Http\Controllers'], function () {
+    Route::get('/install', 'InstallController@index');
+    Route::post('/install', 'InstallController@install');
+    Route::get('/install/update', 'InstallController@update');
+
+    Route::get('/get-recipe-details', 'RecipeController@getRecipeDetails');
+    Route::get('/get-ingredient-row/{variation_id}', 'RecipeController@getIngredientRow');
+    Route::get('/add-ingredient', 'RecipeController@addIngredients');
+    Route::resource('/recipe', 'RecipeController', ['except' => ['edit', 'update', 'destroy']]);
+    Route::resource('/production', 'ProductionController');
+    Route::resource('/settings', 'SettingsController', ['only' => ['index', 'store']]);
+
+    Route::get('/report', 'ProductionController@getManufacturingReport');
+});

@@ -1,0 +1,11 @@
+{
+    "name": "Chat",
+    "alias": "chat",
+    "description": "Chat internal 1-on-1 antar user yang login dalam bisnis yang sama.",
+    "keywords": [],
+    "priority": 0,
+    "providers": [
+        "Modules\\Chat\\Providers\\ChatServiceProvider"
+    ],
+    "files": []
+}

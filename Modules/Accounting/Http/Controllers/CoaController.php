@@ -1,0 +1,2176 @@
+<?php
+
+namespace Modules\Accounting\Http\Controllers;
+
+use App\Utils\ModuleUtil;
+use DB;
+use Illuminate\Http\Request;
+use Illuminate\Http\Response;
+use Illuminate\Routing\Controller;
+use Modules\Accounting\Entities\AccountingAccount;
+use Modules\Accounting\Entities\AccountingAccountsTransaction;
+use Modules\Accounting\Entities\AccountingAccountType;
+use Modules\Accounting\Utils\AccountingUtil;
+use Yajra\DataTables\Facades\DataTables;
+use Illuminate\Support\Str;
+use PhpOffice\PhpSpreadsheet\IOFactory;
+use PhpOffice\PhpSpreadsheet\Shared\Date as ExcelDate;
+
+class CoaController extends Controller
+{
+    protected $accountingUtil;
+
+    /**
+     * Constructor
+     *
+     * @return void
+     */
+    public function __construct(AccountingUtil $accountingUtil, ModuleUtil $moduleUtil)
+    {
+        $this->accountingUtil = $accountingUtil;
+        $this->moduleUtil = $moduleUtil;
+    }
+
+    /**
+     * Display a listing of the resource.
+     *
+     * @return Response
+     */
+    public function index()
+    {
+        $business_id = request()->session()->get('user.business_id');
+
+        if (
+            !(auth()->user()->can('superadmin') ||
+                $this->moduleUtil->hasThePermissionInSubscription($business_id, 'accounting_module')) ||
+            !(auth()->user()->can('accounting.manage_accounts'))
+        ) {
+            abort(403, 'Unauthorized action.');
+        }
+
+        $account_types = AccountingAccountType::accounting_primary_type();
+
+        foreach ($account_types as $k => $v) {
+            $account_types[$k] = $v['label'];
+        }
+
+        if (request()->ajax()) {
+            $balance_formula = $this->accountingUtil->balanceFormula('AA');
+
+            $query = AccountingAccount::where('business_id', $business_id)
+                ->whereNull('parent_account_id')
+                ->with([
+                    'child_accounts' => function ($query) use ($balance_formula) {
+                        $query->select([
+                            DB::raw("(SELECT $balance_formula from accounting_accounts_transactions AS AAT
+                                        JOIN accounting_accounts AS AA ON AAT.accounting_account_id = AA.id
+                                        WHERE AAT.accounting_account_id = accounting_accounts.id) AS balance"),
+                            'accounting_accounts.*'
+                        ]);
+                    },
+                    'child_accounts.detail_type',
+                    'detail_type',
+                    'account_sub_type',
+                    'child_accounts.account_sub_type',
+                ])
+                ->select([
+                    DB::raw("(SELECT $balance_formula
+                                    FROM accounting_accounts_transactions AS AAT 
+                                    JOIN accounting_accounts AS AA ON AAT.accounting_account_id = AA.id
+                                    WHERE AAT.accounting_account_id = accounting_accounts.id) AS balance"),
+                    'accounting_accounts.*',
+                ]);
+
+            if (!empty(request()->input('account_type'))) {
+                $query->where('accounting_accounts.account_primary_type', request()->input('account_type'));
+            }
+            if (!empty(request()->input('status'))) {
+                $query->where('accounting_accounts.status', request()->input('status'));
+            }
+
+            $accounts = $query->get();
+
+            $account_exist = AccountingAccount::where('business_id', $business_id)->exists();
+
+            if (request()->input('view_type') == 'table') {
+                return view('accounting::chart_of_accounts.accounts_table')
+                    ->with(compact('accounts', 'account_exist'));
+            } else {
+                $account_sub_types = AccountingAccountType::where('account_type', 'sub_type')
+                    ->where(function ($q) use ($business_id) {
+                        $q->whereNull('business_id')
+                            ->orWhere('business_id', $business_id);
+                    })
+                    ->get();
+
+                return view('accounting::chart_of_accounts.accounts_tree')
+                    ->with(compact('accounts', 'account_exist', 'account_types', 'account_sub_types'));
+            }
+        }
+
+        return view('accounting::chart_of_accounts.index')->with(compact('account_types'));
+    }
+
+    /**
+     * Show the form for creating a new resource.
+     *
+     * @return Response
+     */
+    public function create()
+    {
+        $business_id = request()->session()->get('user.business_id');
+        if (
+            !(auth()->user()->can('superadmin') ||
+                $this->moduleUtil->hasThePermissionInSubscription($business_id, 'accounting_module')) ||
+            !(auth()->user()->can('accounting.manage_accounts'))
+        ) {
+            abort(403, 'Unauthorized action.');
+        }
+
+        if (request()->ajax()) {
+            $account_types = AccountingAccountType::accounting_primary_type();
+
+            return view('accounting::chart_of_accounts.create')->with(compact('account_types'));
+        }
+    }
+
+    /**
+     * Show the form for creating a new resource.
+     *
+     * @return Response
+     */
+    public function createDefaultAccounts()
+    {
+        //check no accounts
+        $business_id = request()->session()->get('user.business_id');
+
+        if (
+            !(auth()->user()->can('superadmin') ||
+                $this->moduleUtil->hasThePermissionInSubscription($business_id, 'accounting_module')) ||
+            !(auth()->user()->can('accounting.manage_accounts'))
+        ) {
+            abort(403, 'Unauthorized action.');
+        }
+
+        $user_id = request()->session()->get('user.id');
+
+        $default_accounts = [
+            0 => [
+                'name' => 'Accounts Payable (A/P)',
+                'business_id' => $business_id,
+                'account_primary_type' => 'liability',
+                'account_sub_type_id' => 6,
+                'detail_type_id' => 58,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            1 => [
+                'name' => 'Credit Card',
+                'business_id' => $business_id,
+                'account_primary_type' => 'liability',
+                'account_sub_type_id' => 7,
+                'detail_type_id' => 59,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            2 => [
+                'name' => 'Wage expenses',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 14,
+                'detail_type_id' => 140,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            3 => [
+                'name' => 'Utilities',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 14,
+                'detail_type_id' => 149,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            4 => [
+                'name' => 'Unrealised loss on securities, net of tax',
+                'business_id' => $business_id,
+                'account_primary_type' => 'income',
+                'account_sub_type_id' => 12,
+                'detail_type_id' => 113,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            5 => [
+                'name' => 'Undeposited Funds',
+                'business_id' => $business_id,
+                'account_primary_type' => 'asset',
+                'account_sub_type_id' => 2,
+                'detail_type_id' => 29,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            6 => [
+                'name' => 'Uncategorised Income',
+                'business_id' => $business_id,
+                'account_primary_type' => 'income',
+                'account_sub_type_id' => 11,
+                'detail_type_id' => 103,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            7 => [
+                'name' => 'Uncategorised Expense',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 14,
+                'detail_type_id' => 138,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            8 => [
+                'name' => 'Uncategorised Asset',
+                'business_id' => $business_id,
+                'account_primary_type' => 'asset',
+                'account_sub_type_id' => 2,
+                'detail_type_id' => 26,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            9 => [
+                'name' => 'Unapplied Cash Payment Income',
+                'business_id' => $business_id,
+                'account_primary_type' => 'income',
+                'account_sub_type_id' => 11,
+                'detail_type_id' => 105,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            10 => [
+                'name' => 'Travel expenses - selling expense',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 14,
+                'detail_type_id' => '147',
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            11 => [
+                'name' => 'Travel expenses - general and admin expenses',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 14,
+                'detail_type_id' => '146',
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            12 => [
+                'name' => 'Supplies',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 14,
+                'detail_type_id' => 145,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            13 => [
+                'name' => 'Subcontractors - COS',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 13,
+                'detail_type_id' => '114',
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            14 => [
+                'name' => 'Stationery and printing',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 14,
+                'detail_type_id' => '137',
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            15 => [
+                'name' => 'Short-term debit',
+                'business_id' => $business_id,
+                'account_primary_type' => 'liability',
+                'account_sub_type_id' => 8,
+                'detail_type_id' => 69,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            16 => [
+                'name' => 'Shipping and delivery expense',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 14,
+                'detail_type_id' => 143,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            17 => [
+                'name' => 'Share capital',
+                'business_id' => $business_id,
+                'account_primary_type' => 'equity',
+                'account_sub_type_id' => 10,
+                'detail_type_id' => 95,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            18 => [
+                'name' => 'Sales of Product Income',
+                'business_id' => $business_id,
+                'account_primary_type' => 'income',
+                'account_sub_type_id' => 11,
+                'detail_type_id' => 103,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            19 => [
+                'name' => 'Sales - wholesale',
+                'business_id' => $business_id,
+                'account_primary_type' => 'income',
+                'account_sub_type_id' => 11,
+                'detail_type_id' => '102',
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            20 => [
+                'name' => 'Sales - retail',
+                'business_id' => $business_id,
+                'account_primary_type' => 'income',
+                'account_sub_type_id' => 11,
+                'detail_type_id' => '101',
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            21 => [
+                'name' => 'Sales',
+                'business_id' => $business_id,
+                'account_primary_type' => 'income',
+                'account_sub_type_id' => 11,
+                'detail_type_id' => 103,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            22 => [
+                'name' => 'Revenue - General',
+                'business_id' => $business_id,
+                'account_primary_type' => 'income',
+                'account_sub_type_id' => 11,
+                'detail_type_id' => '100',
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            23 => [
+                'name' => 'Retained Earnings',
+                'business_id' => $business_id,
+                'account_primary_type' => 'equity',
+                'account_sub_type_id' => 10,
+                'detail_type_id' => 94,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            24 => [
+                'name' => 'Repair and maintenance',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 14,
+                'detail_type_id' => 142,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            25 => [
+                'name' => 'Rent or lease payments',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 14,
+                'detail_type_id' => 141,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            26 => [
+                'name' => 'Reconciliation Discrepancies',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 15,
+                'detail_type_id' => 153,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            27 => [
+                'name' => 'Purchases',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 14,
+                'detail_type_id' => 144,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            28 => [
+                'name' => 'Property, plant and equipment',
+                'business_id' => $business_id,
+                'account_primary_type' => 'asset',
+                'account_sub_type_id' => 4,
+                'detail_type_id' => 42,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            29 => [
+                'name' => 'Prepaid Expenses',
+                'business_id' => $business_id,
+                'account_primary_type' => 'asset',
+                'account_sub_type_id' => 2,
+                'detail_type_id' => 27,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            30 => [
+                'name' => 'Payroll liabilities',
+                'business_id' => $business_id,
+                'account_primary_type' => 'liability',
+                'account_sub_type_id' => 8,
+                'detail_type_id' => 71,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            31 => [
+                'name' => 'Payroll Expenses',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 14,
+                'detail_type_id' => 140,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            32 => [
+                'name' => 'Payroll Clearing',
+                'business_id' => $business_id,
+                'account_primary_type' => 'liability',
+                'account_sub_type_id' => 8,
+                'detail_type_id' => 70,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            33 => [
+                'name' => 'Overhead - COS',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 13,
+                'detail_type_id' => '114',
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            34 => [
+                'name' => 'Other Types of Expenses-Advertising Expenses',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 14,
+                'detail_type_id' => '119',
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            35 => [
+                'name' => 'Other selling expenses',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 14,
+                'detail_type_id' => 139,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            36 => [
+                'name' => 'Other operating income (expenses)',
+                'business_id' => $business_id,
+                'account_primary_type' => 'income',
+                'account_sub_type_id' => 12,
+                'detail_type_id' => 111,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            37 => [
+                'name' => 'Other general and administrative expenses',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 14,
+                'detail_type_id' => '137',
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            38 => [
+                'name' => 'Other comprehensive income',
+                'business_id' => $business_id,
+                'account_primary_type' => 'equity',
+                'account_sub_type_id' => 10,
+                'detail_type_id' => 87,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            39 => [
+                'name' => 'Other - COS',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 13,
+                'detail_type_id' => '114',
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            40 => [
+                'name' => 'Office expenses',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 14,
+                'detail_type_id' => '137',
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            41 => [
+                'name' => 'Meals and entertainment',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 14,
+                'detail_type_id' => 137,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            42 => [
+                'name' => 'Materials - COS',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 13,
+                'detail_type_id' => '114',
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            43 => [
+                'name' => 'Management compensation',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 14,
+                'detail_type_id' => 135,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            44 => [
+                'name' => 'Loss on disposal of assets',
+                'business_id' => $business_id,
+                'account_primary_type' => 'income',
+                'account_sub_type_id' => 12,
+                'detail_type_id' => 108,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            45 => [
+                'name' => 'Loss on discontinued operations, net of tax',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 14,
+                'detail_type_id' => 134,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            46 => [
+                'name' => 'Long-term investments',
+                'business_id' => $business_id,
+                'account_primary_type' => 'asset',
+                'account_sub_type_id' => 5,
+                'detail_type_id' => 54,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            47 => [
+                'name' => 'Long-term debt',
+                'business_id' => $business_id,
+                'account_primary_type' => 'liability',
+                'account_sub_type_id' => 9,
+                'detail_type_id' => 78,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            48 => [
+                'name' => 'Liabilities related to assets held for sale',
+                'business_id' => $business_id,
+                'account_primary_type' => 'liability',
+                'account_sub_type_id' => 9,
+                'detail_type_id' => 77,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            49 => [
+                'name' => 'Legal and professional fees',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 14,
+                'detail_type_id' => 133,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            50 => [
+                'name' => 'Inventory Asset',
+                'business_id' => $business_id,
+                'account_primary_type' => 'asset',
+                'account_sub_type_id' => 2,
+                'detail_type_id' => 21,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            51 => [
+                'name' => 'Inventory',
+                'business_id' => $business_id,
+                'account_primary_type' => 'asset',
+                'account_sub_type_id' => 2,
+                'detail_type_id' => 21,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            52 => [
+                'name' => 'Interest income',
+                'business_id' => $business_id,
+                'account_primary_type' => 'income',
+                'account_sub_type_id' => 12,
+                'detail_type_id' => 107,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            53 => [
+                'name' => 'Interest expense',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 14,
+                'detail_type_id' => 132,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            54 => [
+                'name' => 'Intangibles',
+                'business_id' => $business_id,
+                'account_primary_type' => 'asset',
+                'account_sub_type_id' => 5,
+                'detail_type_id' => 51,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            55 => [
+                'name' => 'Insurance - Liability',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 14,
+                'detail_type_id' => 131,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            56 => [
+                'name' => 'Insurance - General',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 14,
+                'detail_type_id' => 131,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            57 => [
+                'name' => 'Insurance - Disability',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 14,
+                'detail_type_id' => 131,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            58 => [
+                'name' => 'Income tax payable',
+                'business_id' => $business_id,
+                'account_primary_type' => 'liability',
+                'account_sub_type_id' => 8,
+                'detail_type_id' => 65,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            59 => [
+                'name' => 'Income tax expense',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 14,
+                'detail_type_id' => 130,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            60 => [
+                'name' => 'Goodwill',
+                'business_id' => $business_id,
+                'account_primary_type' => 'asset',
+                'account_sub_type_id' => 5,
+                'detail_type_id' => 50,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            61 => [
+                'name' => 'Freight and delivery - COS',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 13,
+                'detail_type_id' => '114',
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            62 => [
+                'name' => 'Equity in earnings of subsidiaries',
+                'business_id' => $business_id,
+                'account_primary_type' => 'equity',
+                'account_sub_type_id' => 10,
+                'detail_type_id' => 84,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            63 => [
+                'name' => 'Equipment rental',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 14,
+                'detail_type_id' => 128,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            64 => [
+                'name' => 'Dues and Subscriptions',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 14,
+                'detail_type_id' => 127,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            65 => [
+                'name' => 'Dividends payable',
+                'business_id' => $business_id,
+                'account_primary_type' => 'liability',
+                'account_sub_type_id' => 8,
+                'detail_type_id' => 64,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            66 => [
+                'name' => 'Dividend income',
+                'business_id' => $business_id,
+                'account_primary_type' => 'income',
+                'account_sub_type_id' => 12,
+                'detail_type_id' => 106,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            67 => [
+                'name' => 'Dividend disbursed',
+                'business_id' => $business_id,
+                'account_primary_type' => 'equity',
+                'account_sub_type_id' => 10,
+                'detail_type_id' => 83,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            68 => [
+                'name' => 'Discounts given - COS',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 13,
+                'detail_type_id' => '114',
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            69 => [
+                'name' => 'Direct labour - COS',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 13,
+                'detail_type_id' => '114',
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            70 => [
+                'name' => 'Deferred tax assets',
+                'business_id' => $business_id,
+                'account_primary_type' => 'asset',
+                'account_sub_type_id' => 5,
+                'detail_type_id' => 49,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            71 => [
+                'name' => 'Cost of sales',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 13,
+                'detail_type_id' => '118',
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            72 => [
+                'name' => 'Commissions and fees',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 14,
+                'detail_type_id' => 125,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            73 => [
+                'name' => 'Change in inventory - COS',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 13,
+                'detail_type_id' => '114',
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            74 => [
+                'name' => 'Cash and cash equivalents',
+                'business_id' => $business_id,
+                'account_primary_type' => 'asset',
+                'account_sub_type_id' => 3,
+                'detail_type_id' => 31,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            75 => [
+                'name' => 'Billable Expense Income',
+                'business_id' => $business_id,
+                'account_primary_type' => 'income',
+                'account_sub_type_id' => 11,
+                'detail_type_id' => 103,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            76 => [
+                'name' => 'Bank charges',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 14,
+                'detail_type_id' => 123,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            77 => [
+                'name' => 'Bad debts',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 14,
+                'detail_type_id' => 122,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            78 => [
+                'name' => 'Available for sale assets (short-term)',
+                'business_id' => $business_id,
+                'account_primary_type' => 'asset',
+                'account_sub_type_id' => 2,
+                'detail_type_id' => 18,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            79 => [
+                'name' => 'Assets held for sale',
+                'business_id' => $business_id,
+                'account_primary_type' => 'asset',
+                'account_sub_type_id' => 5,
+                'detail_type_id' => 48,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            80 => [
+                'name' => 'Amortisation expense',
+                'business_id' => $business_id,
+                'account_primary_type' => 'expenses',
+                'account_sub_type_id' => 14,
+                'detail_type_id' => 120,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            81 => [
+                'name' => 'Allowance for bad debts',
+                'business_id' => $business_id,
+                'account_primary_type' => 'asset',
+                'account_sub_type_id' => 2,
+                'detail_type_id' => 17,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            82 => [
+                'name' => 'Accumulated depreciation on property, plant and equipment',
+                'business_id' => $business_id,
+                'account_primary_type' => 'asset',
+                'account_sub_type_id' => 4,
+                'detail_type_id' => 38,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            83 => [
+                'name' => 'Accrued non-current liabilities',
+                'business_id' => $business_id,
+                'account_primary_type' => 'liability',
+                'account_sub_type_id' => 9,
+                'detail_type_id' => 76,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            84 => [
+                'name' => 'Accrued liabilities',
+                'business_id' => $business_id,
+                'account_primary_type' => 'liability',
+                'account_sub_type_id' => 8,
+                'detail_type_id' => 60,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            85 => [
+                'name' => 'Accrued holiday payable',
+                'business_id' => $business_id,
+                'account_primary_type' => 'liability',
+                'account_sub_type_id' => 9,
+                'detail_type_id' => 75,
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+            86 => [
+                'name' => 'Accounts Receivable (A/R)',
+                'business_id' => $business_id,
+                'account_primary_type' => 'asset',
+                'account_sub_type_id' => 1,
+                'detail_type_id' => '16',
+                'status' => 'active',
+                'created_by' => $user_id,
+                'created_at' => \Carbon::now(),
+                'updated_at' => \Carbon::now(),
+            ],
+        ];
+
+        if (AccountingAccount::where('business_id', $business_id)->doesntExist()) {
+            AccountingAccount::insert($default_accounts);
+        }
+
+        //redirect back
+        $output = [
+            'success' => 1,
+            'msg' => __('lang_v1.added_success'),
+        ];
+
+        return redirect()->back()->with('status', $output);
+    }
+
+    public function getAccountDetailsType()
+    {
+        $business_id = request()->session()->get('user.business_id');
+
+        if (
+            !(auth()->user()->can('superadmin') ||
+                $this->moduleUtil->hasThePermissionInSubscription($business_id, 'accounting_module')) ||
+            !(auth()->user()->can('accounting.manage_accounts'))
+        ) {
+            abort(403, 'Unauthorized action.');
+        }
+
+        if (request()->ajax()) {
+            $account_type_id = request()->input('account_type_id');
+            $detail_types_obj = AccountingAccountType::where('parent_id', $account_type_id)
+                ->where(function ($q) use ($business_id) {
+                    $q->whereNull('business_id')
+                        ->orWhere('business_id', $business_id);
+                })
+                ->where('account_type', 'detail_type')
+                ->get();
+
+            $parent_accounts = AccountingAccount::where('business_id', $business_id)
+                ->where('account_sub_type_id', $account_type_id)
+                ->whereNull('parent_account_id')
+                ->select('name as text', 'id')
+                ->get();
+            $parent_accounts->prepend([
+                'id' => 'null',
+                'text' => __('messages.please_select'),
+            ]);
+
+            $detail_types = [
+                [
+                    'id' => 'null',
+                    'text' => __('messages.please_select'),
+                    'description' => '',
+                ]
+            ];
+
+            foreach ($detail_types_obj as $detail_type) {
+                $detail_types[] = [
+                    'id' => $detail_type->id,
+                    'text' => __('accounting::lang.' . $detail_type->name),
+                    'description' => !empty($detail_type->description) ?
+                        __('accounting::lang.' . $detail_type->description) : '',
+                ];
+            }
+
+            return [
+                'detail_types' => $detail_types,
+                'parent_accounts' => $parent_accounts,
+            ];
+        }
+    }
+
+    public function getAccountSubTypes()
+    {
+        if (request()->ajax()) {
+            $business_id = request()->session()->get('user.business_id');
+            $account_primary_type = request()->input('account_primary_type');
+            $sub_types_obj = AccountingAccountType::where('account_primary_type', $account_primary_type)
+                ->where(function ($q) use ($business_id) {
+                    $q->whereNull('business_id')
+                        ->orWhere('business_id', $business_id);
+                })
+                ->where('account_type', 'sub_type')
+                ->get();
+
+            $sub_types = [
+                [
+                    'id' => 'null',
+                    'text' => __('messages.please_select'),
+                    'show_balance' => 0,
+                ]
+            ];
+
+            foreach ($sub_types_obj as $st) {
+                $sub_types[] = [
+                    'id' => $st->id,
+                    'text' => $st->account_type_name,
+                    'show_balance' => $st->show_balance,
+                ];
+            }
+
+            return [
+                'sub_types' => $sub_types,
+            ];
+        }
+    }
+
+    /**
+     * Store a newly created resource in storage.
+     *
+     * @param  Request  $request
+     * @return Response
+     */
+    public function store(Request $request)
+    {
+        $business_id = $request->session()->get('user.business_id');
+        if (
+            !(auth()->user()->can('superadmin') ||
+                $this->moduleUtil->hasThePermissionInSubscription($business_id, 'accounting_module')) ||
+            !(auth()->user()->can('accounting.manage_accounts'))
+        ) {
+            abort(403, 'Unauthorized action.');
+        }
+
+        try {
+            DB::beginTransaction();
+
+            $input = $request->only([
+                'name',
+                'account_primary_type',
+                'account_sub_type_id',
+                'detail_type_id',
+                'parent_account_id',
+                'description',
+                'gl_code',
+            ]);
+
+            $account_type = AccountingAccountType::find($input['account_sub_type_id']);
+
+            $input['parent_account_id'] = !empty($input['parent_account_id'])
+                && $input['parent_account_id'] !== 'null' ? $input['parent_account_id'] : null;
+            $input['created_by'] = auth()->user()->id;
+            $input['business_id'] = $request->session()->get('user.business_id');
+            $input['status'] = 'active';
+
+            $account = AccountingAccount::create($input);
+
+            if ($account_type->show_balance == 1 && !empty($request->input('balance'))) {
+                //Opening balance
+                $data = [
+                    'amount' => $this->accountingUtil->num_uf($request->input('balance')),
+                    'accounting_account_id' => $account->id,
+                    'created_by' => auth()->user()->id,
+                    'operation_date' => !empty($request->input('balance_as_of')) ?
+                        $this->accountingUtil->uf_date($request->input('balance_as_of')) :
+                        \Carbon::today()->format('Y-m-d'),
+                ];
+
+                //Opening balance
+                $data['type'] = in_array($input['account_primary_type'], ['asset', 'expenses']) ? 'debit' : 'credit';
+                $data['sub_type'] = 'opening_balance';
+                AccountingAccountsTransaction::createTransaction($data);
+            }
+
+            DB::commit();
+        } catch (\Exception $e) {
+            DB::rollBack();
+
+            \Log::emergency('File:' . $e->getFile() . 'Line:' . $e->getLine() . 'Message:' . $e->getMessage());
+        }
+
+        return redirect()->back();
+    }
+
+    /**
+     * Show the specified resource.
+     *
+     * @param  int  $id
+     * @return Response
+     */
+    public function show($id)
+    {
+    }
+
+    /**
+     * Show the form for editing the specified resource.
+     *
+     * @param  int  $id
+     * @return Response
+     */
+    public function edit($id)
+    {
+        $business_id = request()->session()->get('user.business_id');
+
+        if (
+            !(auth()->user()->can('superadmin') ||
+                $this->moduleUtil->hasThePermissionInSubscription($business_id, 'accounting_module')) ||
+            !(auth()->user()->can('accounting.manage_accounts'))
+        ) {
+            abort(403, 'Unauthorized action.');
+        }
+
+        if (request()->ajax()) {
+            $account = AccountingAccount::where('business_id', $business_id)
+                ->with(['detail_type'])
+                ->find($id);
+
+            $account_types = AccountingAccountType::accounting_primary_type();
+            $account_sub_types = AccountingAccountType::where('account_primary_type', $account->account_primary_type)
+                ->where('account_type', 'sub_type')
+                ->where(function ($q) use ($business_id) {
+                    $q->whereNull('business_id')
+                        ->orWhere('business_id', $business_id);
+                })
+                ->get();
+            $account_detail_types = AccountingAccountType::where('accounting_account_types.parent_id', $account->account_sub_type_id)
+                ->where('accounting_account_types.account_type', 'detail_type')
+                ->leftJoin('accounting_account_types as parent_type', 'accounting_account_types.parent_id', '=', 'parent_type.id')
+                ->where(function ($q) use ($business_id) {
+                    $q->whereNull('accounting_account_types.business_id')
+                        ->orWhere('accounting_account_types.business_id', $business_id);
+                })
+                ->select(
+                    'accounting_account_types.*',
+                    'parent_type.name as parent_sub_type_name'
+                )
+                ->orderBy('parent_type.name')
+                ->orderBy('accounting_account_types.name')
+                ->get();
+
+            $parent_accounts = AccountingAccount::where('business_id', $business_id)
+                ->where('account_sub_type_id', $account->account_sub_type_id)
+                ->whereNull('parent_account_id')
+                ->get();
+
+            return view('accounting::chart_of_accounts.edit')->with(compact(
+                'account_types',
+                'account',
+                'account_sub_types',
+                'account_detail_types',
+                'parent_accounts'
+            ));
+        }
+    }
+
+    /**
+     * Update the specified resource in storage.
+     *
+     * @param  Request  $request
+     * @param  int  $id
+     * @return Response
+     */
+    public function update(Request $request, $id)
+    {
+        $business_id = $request->session()->get('user.business_id');
+        if (
+            !(auth()->user()->can('superadmin') ||
+                $this->moduleUtil->hasThePermissionInSubscription($business_id, 'accounting_module')) ||
+            !(auth()->user()->can('accounting.manage_accounts'))
+        ) {
+            abort(403, 'Unauthorized action.');
+        }
+
+        try {
+            DB::beginTransaction();
+
+            $input = $request->only([
+                'name',
+                'account_primary_type',
+                'account_sub_type_id',
+                'detail_type_id',
+                'parent_account_id',
+                'description',
+                'gl_code',
+            ]);
+
+            $input['parent_account_id'] = !empty($input['parent_account_id'])
+                && $input['parent_account_id'] !== 'null' ? $input['parent_account_id'] : null;
+
+            $account = AccountingAccount::find($id);
+            $account->update($input);
+
+            DB::commit();
+        } catch (\Exception $e) {
+            DB::rollBack();
+
+            \Log::emergency('File:' . $e->getFile() . 'Line:' . $e->getLine() . 'Message:' . $e->getMessage());
+        }
+
+        return redirect()->back();
+    }
+
+    /**
+     * Remove the specified resource from storage.
+     *
+     * @param  int  $id
+     * @return Response
+     */
+    public function destroy($id)
+    {
+        //
+    }
+
+    public function activateDeactivate($id)
+    {
+        $business_id = request()->session()->get('user.business_id');
+        if (
+            !(auth()->user()->can('superadmin') ||
+                $this->moduleUtil->hasThePermissionInSubscription($business_id, 'accounting_module')) ||
+            !(auth()->user()->can('accounting.manage_accounts'))
+        ) {
+            abort(403, 'Unauthorized action.');
+        }
+
+        if (request()->ajax()) {
+            $account = AccountingAccount::where('business_id', $business_id)
+                ->find($id);
+
+            $account->status = $account->status == 'active' ? 'inactive' : 'active';
+            $account->save();
+
+            $msg = $account->status == 'active' ? __('accounting::lang.activated_successfully') :
+                __('accounting::lang.deactivated_successfully');
+            $output = [
+                'success' => 1,
+                'msg' => $msg,
+            ];
+
+            return $output;
+        }
+    }
+
+    /**
+     * Displays the ledger of the account
+     *
+     * @param  int  $account_id
+     * @return Response
+     */
+    public function ledger($account_id)
+    {
+        $business_id = request()->session()->get('user.business_id');
+
+        if (
+            !(auth()->user()->can('superadmin') ||
+                $this->moduleUtil->hasThePermissionInSubscription($business_id, 'accounting_module')) ||
+            !(auth()->user()->can('accounting.manage_accounts'))
+        ) {
+            abort(403, 'Unauthorized action.');
+        }
+
+        $account = AccountingAccount::where('business_id', $business_id)
+            ->with(['account_sub_type', 'detail_type'])
+            ->findorFail($account_id);
+
+        if (request()->ajax()) {
+            $start_date = request()->input('start_date');
+            $end_date = request()->input('end_date');
+            $account_ids = request()->input('account_ids');
+
+            // Use provided account IDs or default to current account
+            if (empty($account_ids)) {
+                $account_ids = [$account->id];
+            } elseif (!is_array($account_ids)) {
+                $account_ids = [$account_ids];
+            }
+
+            $balance_formula = $this->accountingUtil->balanceFormula('AA', 'AAT');
+            $opening_balances = [];
+            if (!empty($start_date)) {
+                $opening_balances = AccountingAccountsTransaction::from('accounting_accounts_transactions as AAT')
+                    ->join('accounting_accounts as AA', 'AAT.accounting_account_id', '=', 'AA.id')
+                    ->whereIn('AAT.accounting_account_id', $account_ids)
+                    ->whereDate('AAT.operation_date', '<', $start_date)
+                    ->select('AAT.accounting_account_id as account_id', DB::raw($balance_formula))
+                    ->groupBy('AAT.accounting_account_id')
+                    ->pluck('balance', 'account_id')
+                    ->toArray();
+            }
+
+            $ending_query = AccountingAccountsTransaction::from('accounting_accounts_transactions as AAT')
+                ->join('accounting_accounts as AA', 'AAT.accounting_account_id', '=', 'AA.id')
+                ->whereIn('AAT.accounting_account_id', $account_ids);
+            if (!empty($end_date)) {
+                $ending_query->whereDate('AAT.operation_date', '<=', $end_date);
+            }
+            $ending_balances = $ending_query->select('AAT.accounting_account_id as account_id', DB::raw($balance_formula))
+                ->groupBy('AAT.accounting_account_id')
+                ->pluck('balance', 'account_id')
+                ->toArray();
+
+            $running_balances = [];
+
+            $transactions = AccountingAccountsTransaction::whereIn('accounting_account_id', $account_ids)
+                ->leftjoin('accounting_acc_trans_mappings as ATM', 'accounting_accounts_transactions.acc_trans_mapping_id', '=', 'ATM.id')
+                ->leftjoin('transactions as T', 'accounting_accounts_transactions.transaction_id', '=', 'T.id')
+                ->leftjoin('users AS U', 'accounting_accounts_transactions.created_by', 'U.id')
+                ->leftjoin('accounting_accounts as AA', 'accounting_accounts_transactions.accounting_account_id', '=', 'AA.id')
+                ->select(
+                    'accounting_accounts_transactions.operation_date',
+                    'accounting_accounts_transactions.sub_type',
+                    'accounting_accounts_transactions.type',
+                    'ATM.ref_no as a_ref',
+                    'ATM.note',
+                    'accounting_accounts_transactions.amount',
+                    'accounting_accounts_transactions.accounting_account_id as account_id',
+                    'AA.name as account_name',
+                    'AA.gl_code as account_gl_code',
+                    'AA.account_primary_type as account_primary_type',
+                    DB::raw("CONCAT(COALESCE(U.surname, ''),' ',COALESCE(U.first_name, ''),' ',COALESCE(U.last_name,'')) as added_by"),
+                    'T.invoice_no',
+                    'T.ref_no'
+                )
+                ->orderBy('AA.name', 'ASC')
+                ->orderBy('accounting_accounts_transactions.operation_date', 'ASC')
+                ->orderBy('accounting_accounts_transactions.id', 'ASC');
+            if (!empty($start_date) && !empty($end_date)) {
+                $transactions->whereDate('accounting_accounts_transactions.operation_date', '>=', $start_date)
+                    ->whereDate('accounting_accounts_transactions.operation_date', '<=', $end_date);
+            }
+
+            return DataTables::of($transactions)
+                ->editColumn('operation_date', function ($row) {
+                    return $this->accountingUtil->format_date($row->operation_date, true);
+                })
+                ->addColumn('account_name', function ($row) {
+                    $account_display = $row->account_name;
+                    if (!empty($row->account_gl_code)) {
+                        $account_display .= ' (' . $row->account_gl_code . ')';
+                    }
+                    return '<span class="label label-default">' . $account_display . '</span>';
+                })
+                ->editColumn('ref_no', function ($row) {
+                    $description = '';
+
+                    if ($row->sub_type == 'journal_entry') {
+                        $description = $row->a_ref;
+                    }
+
+                    if ($row->sub_type == 'opening_balance') {
+                        $description = '<b>' . __('accounting::lang.opening_balance') . '</b>';
+                    }
+
+                    if ($row->sub_type == 'sell') {
+                        $description = $row->invoice_no;
+                    }
+
+                    if ($row->sub_type == 'expense') {
+                        $description = $row->ref_no;
+                    }
+
+                    return $description;
+                })
+                ->addColumn('debit', function ($row) {
+                    if ($row->type == 'debit') {
+                        return '<span class="debit" data-orig-value="' . $row->amount . '">' . $this->accountingUtil->num_f($row->amount, true) . '</span>';
+                    }
+
+                    return '';
+                })
+                ->addColumn('credit', function ($row) {
+                    if ($row->type == 'credit') {
+                        return '<span class="credit"  data-orig-value="' . $row->amount . '">' . $this->accountingUtil->num_f($row->amount, true) . '</span>';
+                    }
+
+                    return '';
+                })
+                ->addColumn('document_ref_no', function ($row) {
+                    // Priority: invoice_no > ref_no from transaction > a_ref from journal
+                    $doc_ref = '';
+                    if (!empty($row->invoice_no)) {
+                        $doc_ref = $row->invoice_no;
+                    } elseif (!empty($row->ref_no)) {
+                        $doc_ref = $row->ref_no;
+                    } elseif (!empty($row->a_ref)) {
+                        $doc_ref = $row->a_ref;
+                    }
+                    return $doc_ref;
+                })
+                ->addColumn('balance', function ($row) use (&$running_balances, $opening_balances) {
+                    $account_id = $row->account_id;
+                    if (!isset($running_balances[$account_id])) {
+                        $running_balances[$account_id] = $opening_balances[$account_id] ?? 0;
+                    }
+
+                    if (in_array($row->account_primary_type, ['asset', 'expenses'])) {
+                        $multiplier = $row->type == 'debit' ? 1 : -1;
+                    } else {
+                        $multiplier = $row->type == 'credit' ? 1 : -1;
+                    }
+
+                    $running_balances[$account_id] += ($multiplier * $row->amount);
+
+                    return '<span class="balance" data-orig-value="' . $running_balances[$account_id] . '">' . $this->accountingUtil->num_f($running_balances[$account_id], true) . '</span>';
+                })
+                // ->addColumn('balance', function ($row) use ($bal_before_start_date, $start_date) {
+                //     //TODO:: Need to fix same balance showing for transactions having same operation date
+                //     $current_bal = AccountingAccountsTransaction::where('accounting_account_id',
+                //                         $row->account_id)
+                //                     ->where('operation_date', '>=', $start_date)
+                //                     ->where('operation_date', '<=', $row->operation_date)
+                //                     ->select(DB::raw("SUM(IF(type='credit', amount, -1 * amount)) as balance"))
+                //                     ->first()->balance;
+                //     $bal = $bal_before_start_date + $current_bal;
+                //     return '<span class="balance" data-orig-value="' . $bal . '">' . $this->accountingUtil->num_f($bal, true) . '</span>';
+                // })
+                // ->editColumn('action', function ($row) {
+                //     $action = '';
+
+                //     return $action;
+                // })
+                ->filterColumn('added_by', function ($query, $keyword) {
+                    $query->whereRaw("CONCAT(COALESCE(u.surname, ''), ' ', COALESCE(u.first_name, ''), ' ', COALESCE(u.last_name, '')) like ?", ["%{$keyword}%"]);
+                })
+                ->rawColumns(['ref_no', 'credit', 'debit', 'balance', 'account_name'])
+                ->with('opening_balances', $opening_balances)
+                ->with('ending_balances', $ending_balances)
+                ->make(true);
+        }
+
+        $current_bal = AccountingAccount::leftjoin(
+            'accounting_accounts_transactions as AAT',
+            'AAT.accounting_account_id',
+            '=',
+            'accounting_accounts.id'
+        )
+            ->where('business_id', $business_id)
+            ->where('accounting_accounts.id', $account->id)
+            ->select([DB::raw($this->accountingUtil->balanceFormula())]);
+        $current_bal = $current_bal->first()->balance;
+
+        // Get all accounts for multiselect dropdown
+        $all_accounts = AccountingAccount::where('business_id', $business_id)
+            ->where('status', 'active')
+            ->orderBy('name')
+            ->get()
+            ->mapWithKeys(function ($acc) {
+                $name = $acc->name;
+                if (!empty($acc->gl_code)) {
+                    $name .= ' (' . $acc->gl_code . ')';
+                }
+                return [$acc->id => $name];
+            })
+            ->toArray();
+
+        // Pass opening_balance for client-side balance calculation
+        return view('accounting::chart_of_accounts.ledger')
+            ->with(compact('account', 'current_bal', 'all_accounts'));
+    }
+
+    /**
+     * Displays the ledger of the account
+     *
+     * @param  int  $account_id
+     * @return Response
+     */
+    public function journal_entry($account_id)
+    {
+        $business_id = request()->session()->get('user.business_id');
+
+        if (
+            !(auth()->user()->can('superadmin') ||
+                $this->moduleUtil->hasThePermissionInSubscription($business_id, 'accounting_module')) ||
+            !(auth()->user()->can('accounting.manage_accounts'))
+        ) {
+            abort(403, 'Unauthorized action.');
+        }
+
+        $account = AccountingAccount::where('business_id', $business_id)
+            ->with(['account_sub_type', 'detail_type'])
+            ->findorFail($account_id);
+
+        if (request()->ajax()) {
+            $start_date = request()->input('start_date');
+            $end_date = request()->input('end_date');
+            $account_ids = request()->input('account_ids');
+
+            // Use provided account IDs or default to current account
+            if (empty($account_ids)) {
+                $account_ids = [$account->id];
+            } elseif (!is_array($account_ids)) {
+                $account_ids = [$account_ids];
+            }
+
+            $opening_balances = [];
+            if (!empty($start_date)) {
+                $balance_formula = $this->accountingUtil->balanceFormula('AA', 'AAT');
+                $opening_balances = AccountingAccountsTransaction::from('accounting_accounts_transactions as AAT')
+                    ->join('accounting_accounts as AA', 'AAT.accounting_account_id', '=', 'AA.id')
+                    ->whereIn('AAT.accounting_account_id', $account_ids)
+                    ->whereDate('AAT.operation_date', '<', $start_date)
+                    ->select('AAT.accounting_account_id as account_id', DB::raw($balance_formula))
+                    ->groupBy('AAT.accounting_account_id')
+                    ->pluck('balance', 'account_id')
+                    ->toArray();
+            }
+
+            $running_balances = [];
+
+            $transactions = AccountingAccountsTransaction::whereIn('accounting_account_id', $account_ids)
+                ->leftjoin('accounting_acc_trans_mappings as ATM', 'accounting_accounts_transactions.acc_trans_mapping_id', '=', 'ATM.id')
+                ->leftjoin('transactions as T', 'accounting_accounts_transactions.transaction_id', '=', 'T.id')
+                ->leftjoin('users AS U', 'accounting_accounts_transactions.created_by', 'U.id')
+                ->leftjoin('accounting_accounts as AA', 'accounting_accounts_transactions.accounting_account_id', '=', 'AA.id')
+                ->select(
+                    'accounting_accounts_transactions.operation_date',
+                    'accounting_accounts_transactions.sub_type',
+                    'accounting_accounts_transactions.type',
+                    'ATM.ref_no as a_ref',
+                    'ATM.note',
+                    'accounting_accounts_transactions.amount',
+                    'accounting_accounts_transactions.accounting_account_id as account_id',
+                    'AA.name as account_name',
+                    'AA.gl_code as account_gl_code',
+                    'AA.account_primary_type as account_primary_type',
+                    DB::raw("CONCAT(COALESCE(U.surname, ''),' ',COALESCE(U.first_name, ''),' ',COALESCE(U.last_name,'')) as added_by"),
+                    'T.invoice_no',
+                    'T.ref_no'
+                )
+                ->orderBy('AA.name', 'ASC')
+                ->orderBy('accounting_accounts_transactions.operation_date', 'ASC')
+                ->orderBy('accounting_accounts_transactions.id', 'ASC');
+            if (!empty($start_date) && !empty($end_date)) {
+                $transactions->whereDate('accounting_accounts_transactions.operation_date', '>=', $start_date)
+                    ->whereDate('accounting_accounts_transactions.operation_date', '<=', $end_date);
+            }
+
+            return DataTables::of($transactions)
+                ->editColumn('operation_date', function ($row) {
+                    return $this->accountingUtil->format_date($row->operation_date, true);
+                })
+                ->addColumn('account_name', function ($row) {
+                    $account_display = $row->account_name;
+                    if (!empty($row->account_gl_code)) {
+                        $account_display .= ' (' . $row->account_gl_code . ')';
+                    }
+                    return '<span class="label label-default">' . $account_display . '</span>';
+                })
+                ->editColumn('ref_no', function ($row) {
+                    $description = '';
+
+                    if ($row->sub_type == 'journal_entry') {
+                        $description = $row->a_ref;
+                    }
+
+                    if ($row->sub_type == 'opening_balance') {
+                        $description = '<b>' . __('accounting::lang.opening_balance') . '</b>';
+                    }
+
+                    if ($row->sub_type == 'sell') {
+                        $description = $row->invoice_no;
+                    }
+
+                    if ($row->sub_type == 'expense') {
+                        $description = $row->ref_no;
+                    }
+
+                    return $description;
+                })
+                ->addColumn('debit', function ($row) {
+                    if ($row->type == 'debit') {
+                        return '<span class="debit" data-orig-value="' . $row->amount . '">' . $this->accountingUtil->num_f($row->amount, true) . '</span>';
+                    }
+
+                    return '';
+                })
+                ->addColumn('credit', function ($row) {
+                    if ($row->type == 'credit') {
+                        return '<span class="credit"  data-orig-value="' . $row->amount . '">' . $this->accountingUtil->num_f($row->amount, true) . '</span>';
+                    }
+
+                    return '';
+                })
+                ->addColumn('balance', function ($row) use (&$running_balances, $opening_balances) {
+                    $account_id = $row->account_id;
+                    if (!isset($running_balances[$account_id])) {
+                        $running_balances[$account_id] = $opening_balances[$account_id] ?? 0;
+                    }
+
+                    if (in_array($row->account_primary_type, ['asset', 'expenses'])) {
+                        $multiplier = $row->type == 'debit' ? 1 : -1;
+                    } else {
+                        $multiplier = $row->type == 'credit' ? 1 : -1;
+                    }
+
+                    $running_balances[$account_id] += ($multiplier * $row->amount);
+
+                    return '<span class="balance" data-orig-value="' . $running_balances[$account_id] . '">' . $this->accountingUtil->num_f($running_balances[$account_id], true) . '</span>';
+                })
+                // ->addColumn('balance', function ($row) use ($bal_before_start_date, $start_date) {
+                //     //TODO:: Need to fix same balance showing for transactions having same operation date
+                //     $current_bal = AccountingAccountsTransaction::where('accounting_account_id',
+                //                         $row->account_id)
+                //                     ->where('operation_date', '>=', $start_date)
+                //                     ->where('operation_date', '<=', $row->operation_date)
+                //                     ->select(DB::raw("SUM(IF(type='credit', amount, -1 * amount)) as balance"))
+                //                     ->first()->balance;
+                //     $bal = $bal_before_start_date + $current_bal;
+                //     return '<span class="balance" data-orig-value="' . $bal . '">' . $this->accountingUtil->num_f($bal, true) . '</span>';
+                // })
+                // ->editColumn('action', function ($row) {
+                //     $action = '';
+
+                //     return $action;
+                // })
+                ->filterColumn('added_by', function ($query, $keyword) {
+                    $query->whereRaw("CONCAT(COALESCE(u.surname, ''), ' ', COALESCE(u.first_name, ''), ' ', COALESCE(u.last_name, '')) like ?", ["%{$keyword}%"]);
+                })
+                ->rawColumns(['ref_no', 'credit', 'debit', 'balance', 'account_name'])
+                ->make(true);
+        }
+
+        $current_bal = AccountingAccount::leftjoin(
+            'accounting_accounts_transactions as AAT',
+            'AAT.accounting_account_id',
+            '=',
+            'accounting_accounts.id'
+        )
+            ->where('business_id', $business_id)
+            ->where('accounting_accounts.id', $account->id)
+            ->select([DB::raw($this->accountingUtil->balanceFormula())]);
+        $current_bal = $current_bal->first()->balance;
+
+        // Get all accounts for multiselect dropdown
+        $all_accounts = AccountingAccount::where('business_id', $business_id)
+            ->where('status', 'active')
+            ->orderBy('name')
+            ->get()
+            ->mapWithKeys(function ($acc) {
+                $name = $acc->name;
+                if (!empty($acc->gl_code)) {
+                    $name .= ' (' . $acc->gl_code . ')';
+                }
+                return [$acc->id => $name];
+            })
+            ->toArray();
+
+        return view('accounting::chart_of_accounts.journal_entry')
+            ->with(compact('account', 'current_bal', 'all_accounts'));
+    }
+
+    public function downloadCoaTemplate()
+    {
+        $path = base_path('Template_Import_COA_BMBJ.xlsx');
+        if (!file_exists($path)) {
+            return back()->with('error', 'File template tidak ditemukan.');
+        }
+        return response()->download($path, 'Template_Import_COA_BMBJ.xlsx', [
+            'Content-Type' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        ]);
+    }
+
+    public function importCoa(Request $request)
+    {
+        $business_id = $request->session()->get('user.business_id');
+
+        if (
+            !(auth()->user()->can('superadmin') ||
+                $this->moduleUtil->hasThePermissionInSubscription($business_id, 'accounting_module')) ||
+            !(auth()->user()->can('accounting.manage_accounts'))
+        ) {
+            abort(403, 'Unauthorized action.');
+        }
+
+        $request->validate([
+            'coa_import_file' => 'required|file|mimes:xls,xlsx,csv',
+        ]);
+
+        try {
+            DB::beginTransaction();
+
+            $user_id = $request->session()->get('user.id');
+            $file = $request->file('coa_import_file');
+            $skip_existing = $request->boolean('skip_existing', true);
+
+            $spreadsheet = IOFactory::load($file->getRealPath());
+            $sheet = $spreadsheet->getActiveSheet();
+            $highestRow = $sheet->getHighestRow();
+
+            if ($highestRow < 2) {
+                return response()->json(['success' => false, 'msg' => __('messages.no_data_found')]);
+            }
+
+            $imported     = 0;
+            $skipped      = 0;
+            $balances_set = 0;
+            $errors       = [];
+
+            // Cache sub types
+            $sub_types = AccountingAccountType::where('account_type', 'sub_type')
+                ->where(function ($q) use ($business_id) {
+                    $q->whereNull('business_id')->orWhere('business_id', $business_id);
+                })
+                ->get()
+                ->keyBy(fn($st) => strtolower(trim($st->account_type_name)));
+
+            $valid_types = ['asset', 'liability', 'equity', 'income', 'expenses'];
+
+            // ── PASS 1: baca semua baris, simpan akun, catat mapping gl_code → id ─
+            // Juga simpan parent_gl per baris untuk diselesaikan di pass 2.
+            $created_gl_map  = [];   // gl_code => account_id  (yang baru dibuat pass ini)
+            $pending_parents = [];   // account_id => parent_gl_code
+
+            for ($row = 2; $row <= $highestRow; $row++) {
+                // Use getFormattedValue() for GL code columns to preserve trailing zeros
+                // e.g. "1101.10" must not become "1101.1" when the cell is numeric
+                $gl_code       = trim($sheet->getCellByColumnAndRow(1, $row)->getFormattedValue());
+                $name          = trim((string) $sheet->getCellByColumnAndRow(2, $row)->getCalculatedValue());
+                $primary_type  = strtolower(trim((string) $sheet->getCellByColumnAndRow(3, $row)->getCalculatedValue()));
+                $sub_type_name = strtolower(trim((string) $sheet->getCellByColumnAndRow(4, $row)->getCalculatedValue()));
+                $description   = trim((string) $sheet->getCellByColumnAndRow(5, $row)->getCalculatedValue());
+                $parent_gl     = trim($sheet->getCellByColumnAndRow(6, $row)->getFormattedValue());
+                $saldo_awal    = trim((string) $sheet->getCellByColumnAndRow(7, $row)->getCalculatedValue());
+                $saldo_date_cell = $sheet->getCellByColumnAndRow(8, $row);
+
+                if (empty($name) || empty($primary_type)) {
+                    // Baris section header atau baris kosong — lewati tanpa error
+                    continue;
+                }
+
+                if (!in_array($primary_type, $valid_types)) {
+                    $errors[] = "Baris {$row}: Tipe Utama '{$primary_type}' tidak valid.";
+                    continue;
+                }
+
+                if ($skip_existing) {
+                    $existing_account = AccountingAccount::where('business_id', $business_id)
+                        ->where('name', $name)->first();
+                    if ($existing_account) {
+                        // Masukkan ke map agar bisa jadi parent akun lain
+                        if (!empty($gl_code)) {
+                            $created_gl_map[$gl_code] = $existing_account->id;
+                        }
+                        if ($this->insertCoaOpeningBalance($existing_account, $saldo_awal, $saldo_date_cell, $user_id, $errors, $row)) {
+                            $balances_set++;
+                        }
+                        $skipped++;
+                        continue;
+                    }
+                }
+
+                $sub_type_id = null;
+                if (!empty($sub_type_name) && isset($sub_types[$sub_type_name])) {
+                    $sub_type_id = $sub_types[$sub_type_name]->id;
+                } else {
+                    $default_sub = $sub_types->first(fn($st) => $st->account_primary_type === $primary_type);
+                    $sub_type_id = $default_sub ? $default_sub->id : null;
+                }
+
+                $account = AccountingAccount::create([
+                    'name'                 => $name,
+                    'business_id'          => $business_id,
+                    'account_primary_type' => $primary_type,
+                    'account_sub_type_id'  => $sub_type_id,
+                    'gl_code'              => $gl_code ?: null,
+                    'description'          => $description ?: null,
+                    'status'               => 'active',
+                    'created_by'           => $user_id,
+                ]);
+
+                $imported++;
+
+                if (!empty($gl_code)) {
+                    $created_gl_map[$gl_code] = $account->id;
+                }
+
+                if (!empty($parent_gl)) {
+                    $pending_parents[$account->id] = $parent_gl;
+                }
+
+                if ($this->insertCoaOpeningBalance($account, $saldo_awal, $saldo_date_cell, $user_id, $errors, $row)) {
+                    $balances_set++;
+                }
+            }
+
+            // ── PASS 2: resolve parent account by GL code ─────────────────────────
+            // Cari juga akun lama yang mungkin sudah ada di DB sebagai parent
+            $parent_linked = 0;
+            if (!empty($pending_parents)) {
+                // Ambil semua GL code yang menjadi parent, cari id-nya
+                $all_parent_gls = array_unique(array_values($pending_parents));
+
+                $existing_parents = AccountingAccount::where('business_id', $business_id)
+                    ->whereIn('gl_code', $all_parent_gls)
+                    ->pluck('id', 'gl_code')
+                    ->toArray();
+
+                // Merge: created_gl_map (baru) override existing_parents (lama) jika sama
+                $gl_to_id = array_merge($existing_parents, $created_gl_map);
+
+                foreach ($pending_parents as $account_id => $parent_gl) {
+                    if (isset($gl_to_id[$parent_gl])) {
+                        AccountingAccount::where('id', $account_id)
+                            ->update(['parent_account_id' => $gl_to_id[$parent_gl]]);
+                        $parent_linked++;
+                    } else {
+                        $errors[] = "Parent GL '{$parent_gl}' tidak ditemukan, relasi dilewati.";
+                    }
+                }
+            }
+
+            DB::commit();
+
+            $msg = "Berhasil import {$imported} akun.";
+            if ($parent_linked > 0) {
+                $msg .= " {$parent_linked} akun terhubung ke parent.";
+            }
+            if ($skipped > 0) {
+                $msg .= " {$skipped} akun dilewati (sudah ada).";
+            }
+            if ($balances_set > 0) {
+                $msg .= " {$balances_set} saldo awal diinput.";
+            }
+            if (!empty($errors)) {
+                $msg .= ' Catatan: ' . implode(' | ', array_slice($errors, 0, 5));
+            }
+
+            return response()->json(['success' => true, 'msg' => $msg]);
+        } catch (\Exception $e) {
+            DB::rollBack();
+            \Log::emergency('File:' . $e->getFile() . ' Line:' . $e->getLine() . ' Message:' . $e->getMessage());
+            return response()->json(['success' => false, 'msg' => 'Import gagal: ' . $e->getMessage()]);
+        }
+    }
+
+    /**
+     * Insert an opening_balance transaction for an account created/matched during
+     * COA import, following the same debit/credit convention as manual account
+     * creation (store()): asset & expenses default to debit, liability/equity/income
+     * default to credit; flipped if the sheet value is negative. Idempotent: skips
+     * if an opening_balance entry already exists for that account + date.
+     *
+     * @param  AccountingAccount  $account
+     * @param  string  $saldo_awal_raw  raw calculated cell value from column 7
+     * @param  \PhpOffice\PhpSpreadsheet\Cell\Cell  $date_cell  raw cell from column 8
+     * @param  int  $user_id
+     * @param  array  $errors  passed by reference to append parse warnings
+     * @param  int  $row  spreadsheet row number, for error messages
+     * @return bool  true if a transaction was inserted
+     */
+    private function insertCoaOpeningBalance(AccountingAccount $account, $saldo_awal_raw, $date_cell, $user_id, array &$errors, $row)
+    {
+        $amount_str = str_replace([' ', ','], '', trim((string) $saldo_awal_raw));
+        if ($amount_str === '' || $amount_str === '-' || !is_numeric($amount_str)) {
+            return false;
+        }
+
+        $amount = (float) $amount_str;
+        if ($amount == 0.0) {
+            return false;
+        }
+
+        // Resolve tanggal saldo awal: cell Excel date, string tanggal, atau default hari ini
+        $date_value = $date_cell->getValue();
+        $operation_date = null;
+        if (!empty($date_value)) {
+            try {
+                if (is_numeric($date_value) && ExcelDate::isDateTime($date_cell)) {
+                    $operation_date = ExcelDate::excelToDateTimeObject($date_value)->format('Y-m-d');
+                } else {
+                    $operation_date = \Carbon::parse((string) $date_value)->format('Y-m-d');
+                }
+            } catch (\Exception $e) {
+                $errors[] = "Baris {$row}: Tanggal Saldo Awal '{$date_value}' tidak valid, dilewati.";
+
+                return false;
+            }
+        } else {
+            $operation_date = \Carbon::today()->format('Y-m-d');
+        }
+        $operation_datetime = $operation_date . ' 00:00:00';
+
+        $exists = AccountingAccountsTransaction::where('accounting_account_id', $account->id)
+            ->where('sub_type', 'opening_balance')
+            ->where('operation_date', $operation_datetime)
+            ->exists();
+        if ($exists) {
+            return false;
+        }
+
+        $base_type = in_array($account->account_primary_type, ['asset', 'expenses']) ? 'debit' : 'credit';
+        $type = $amount < 0 ? ($base_type === 'debit' ? 'credit' : 'debit') : $base_type;
+
+        AccountingAccountsTransaction::createTransaction([
+            'amount' => abs($amount),
+            'accounting_account_id' => $account->id,
+            'created_by' => $user_id,
+            'operation_date' => $operation_date,
+            'type' => $type,
+            'sub_type' => 'opening_balance',
+        ]);
+
+        return true;
+    }
+
+    public function getAccountDetails()
+    {
+        $business_id = request()->session()->get('user.business_id');
+
+        if (
+            !(auth()->user()->can('superadmin') ||
+                $this->moduleUtil->hasThePermissionInSubscription($business_id, 'accounting_module')) ||
+            !(auth()->user()->can('accounting.manage_accounts'))
+        ) {
+            abort(403, 'Unauthorized action.');
+        }
+
+        if (request()->ajax()) {
+            $account_ids = request()->input('account_ids');
+
+            if (empty($account_ids) || !is_array($account_ids)) {
+                return response()->json(['error' => 'Invalid account IDs'], 400);
+            }
+
+            // Get account details
+            $accounts = AccountingAccount::whereIn('id', $account_ids)
+                ->where('business_id', $business_id)
+                ->with(['account_sub_type', 'detail_type'])
+                ->get();
+
+            if ($accounts->isEmpty()) {
+                return response()->json(['error' => 'No accounts found'], 404);
+            }
+
+            // Calculate balance for each account and sum them
+            $total_balance = 0;
+            foreach ($account_ids as $acc_id) {
+                $balance = AccountingAccount::leftjoin(
+                    'accounting_accounts_transactions as AAT',
+                    'AAT.accounting_account_id',
+                    '=',
+                    'accounting_accounts.id'
+                )
+                    ->where('accounting_accounts.business_id', $business_id)
+                    ->where('accounting_accounts.id', $acc_id)
+                    ->select([DB::raw($this->accountingUtil->balanceFormula())])
+                    ->first();
+
+                if ($balance) {
+                    $total_balance += $balance->balance;
+                }
+            }
+
+            // Prepare account details
+            $account_details = [];
+            foreach ($accounts as $account) {
+                $account_details[] = [
+                    'id' => $account->id,
+                    'name' => $account->name,
+                    'gl_code' => $account->gl_code,
+                    'account_primary_type' => $account->account_primary_type,
+                    'account_sub_type' => $account->account_sub_type ? $account->account_sub_type->name : null,
+                    'detail_type' => $account->detail_type ? $account->detail_type->name : null,
+                ];
+            }
+
+            return response()->json([
+                'accounts' => $account_details,
+                'total_balance' => $total_balance,
+                'count' => count($account_details)
+            ]);
+        }
+    }
+}
